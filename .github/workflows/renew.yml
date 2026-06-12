@@ -29,7 +29,20 @@ jobs:
         sudo apt-get update
         sudo apt-get install -y xvfb
         npm install
-        npx playwright install-deps chrome
+        npx playwright install chromium
+        npx playwright install-deps chromium
+
+    - name: Diagnose Chrome
+      run: |
+        which google-chrome || true
+        which google-chrome-stable || true
+        which chromium || true
+        which chromium-browser || true
+        ls -l /usr/bin/google-chrome* /usr/bin/chromium* 2>/dev/null || true
+        google-chrome --version || true
+        google-chrome-stable --version || true
+        chromium --version || true
+        node -e "const { chromium } = require('playwright'); console.log('Playwright Chromium:', chromium.executablePath())"
       
     - name: Run Renew Script
       env:

@@ -1,4 +1,5 @@
 const { chromium } = require('playwright-extra');
+const { chromium: playwrightChromium } = require('playwright');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 const axios = require('axios');
 const fs = require('fs');
@@ -44,8 +45,14 @@ async function sendTelegramMessage(message, imagePath = null) {
 // 启用 stealth 插件
 chromium.use(stealth);
 
-// GitHub Actions 环境下的 Chrome 路径 (通常是 google-chrome)
-const CHROME_PATH = process.env.CHROME_PATH || '/usr/bin/google-chrome';
+// GitHub Actions 环境下优先使用系统 Chrome；若不存在则自动回退到 Playwright 下载的 Chromium。
+const DEFAULT_CHROME_CANDIDATES = [
+    process.env.CHROME_PATH,
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser'
+].filter(Boolean);
 const DEBUG_HOST = '127.0.0.1';
 const DEBUG_PORT = 9222;
 
@@ -171,6 +178,24 @@ function checkPort(port) {
     });
 }
 
+function getChromeExecutablePath() {
+    const candidates = [...DEFAULT_CHROME_CANDIDATES];
+
+    try {
+        const playwrightPath = playwrightChromium.executablePath();
+        if (playwrightPath) candidates.push(playwrightPath);
+    } catch (e) {
+        console.log(`[Chrome] 获取 Playwright Chromium 路径失败: ${e.message}`);
+    }
+
+    for (const candidate of candidates) {
+        if (fs.existsSync(candidate)) return candidate;
+        console.log(`[Chrome] 候选路径不存在，跳过: ${candidate}`);
+    }
+
+    throw new Error(`未找到可用的 Chrome/Chromium。已检查: ${candidates.join(', ')}`);
+}
+
 async function launchChrome() {
     console.log('检查 Chrome 是否已在端口 ' + DEBUG_PORT + ' 上运行...');
     if (await checkPort(DEBUG_PORT)) {
@@ -178,43 +203,63 @@ async function launchChrome() {
         return;
     }
 
-    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+    const chromePath = getChromeExecutablePath();
+    console.log(`正在启动 Chrome (路径: ${chromePath})...`);
 
     const args = [
         `--remote-debugging-address=${DEBUG_HOST}`,
         `--remote-debugging-port=${DEBUG_PORT}`,
         '--no-first-run',
         '--no-default-browser-check',
-        // '--headless=new', // (已被注释) 使用 xvfb-run 时不需要 headless 模式，这样可以模拟有头浏览器增加成功率
+        // '--headless=new', // 使用 xvfb-run 时不需要 headless 模式，这样可以模拟有头浏览器增加成功率
         '--disable-gpu',
         '--window-size=1280,720',
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--user-data-dir=/tmp/chrome_user_data' // 必须指定用户数据目录，否则远程调试可能失败
+        '--user-data-dir=/tmp/chrome_user_data', // 必须指定用户数据目录，否则远程调试可能失败
+        '--disable-dev-shm-usage' // 避免共享内存不足
     ];
 
     if (PROXY_CONFIG) {
         args.push(`--proxy-server=${PROXY_CONFIG.server}`);
         args.push('--proxy-bypass-list=<-loopback>');
     }
-    // 添加针对 Linux 环境的额外稳定性参数
-    args.push('--disable-dev-shm-usage'); // 避免共享内存不足
 
-
-    const chrome = spawn(CHROME_PATH, args, {
+    const chrome = spawn(chromePath, args, {
         detached: true,
-        stdio: 'ignore'
+        stdio: ['ignore', 'pipe', 'pipe']
+    });
+
+    let chromeOutput = '';
+    const collectChromeOutput = (streamName, data) => {
+        const text = data.toString();
+        chromeOutput += `[${streamName}] ${text}`;
+        const trimmed = text.trim();
+        if (trimmed) console.log(`[Chrome ${streamName}] ${trimmed}`);
+        if (chromeOutput.length > 8000) chromeOutput = chromeOutput.slice(-8000);
+    };
+
+    chrome.stdout.on('data', data => collectChromeOutput('stdout', data));
+    chrome.stderr.on('data', data => collectChromeOutput('stderr', data));
+    chrome.on('error', err => {
+        console.error(`[Chrome] 启动进程失败: ${err.message}`);
+    });
+    chrome.on('exit', (code, signal) => {
+        if (code !== null || signal) console.log(`[Chrome] 进程退出: code=${code}, signal=${signal}`);
     });
     chrome.unref();
 
     console.log('正在等待 Chrome 初始化...');
-    for (let i = 0; i < 20; i++) {
+    for (let i = 0; i < 30; i++) {
         if (await checkPort(DEBUG_PORT)) break;
         await new Promise(r => setTimeout(r, 1000));
     }
 
     if (!await checkPort(DEBUG_PORT)) {
         console.error('Chrome 无法在端口 ' + DEBUG_PORT + ' 上启动');
+        if (chromeOutput.trim()) {
+            console.error(`[Chrome] 最近输出:\n${chromeOutput.trim()}`);
+        }
         throw new Error('Chrome 启动失败');
     }
 }
