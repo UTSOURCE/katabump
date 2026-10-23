@@ -165,14 +165,35 @@ function checkPort(port) {
     });
 }
 
-async function launchChrome() {
-    console.log('检查 Chrome 是否已在端口 ' + DEBUG_PORT + ' 上运行...');
-    if (await checkPort(DEBUG_PORT)) {
-        console.log('Chrome 已开启。');
-        return;
-    }
+const CHROME_USER_DATA_DIR = '/tmp/chrome_user_data';
+const CHROME_LOG_PATH = path.join(process.cwd(), 'chrome.log');
+const CHROME_START_ATTEMPTS = 3;
+const CHROME_START_TIMEOUT_MS = 25000;
 
-    console.log(`正在启动 Chrome (路径: ${CHROME_PATH})...`);
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function printChromeLog(lines = 40) {
+    try {
+        const content = fs.readFileSync(CHROME_LOG_PATH, 'utf8').trim();
+        if (!content) return;
+        console.error(`--- chrome.log (最后 ${lines} 行) ---`);
+        console.error(content.split('\n').slice(-lines).join('\n'));
+        console.error('--- chrome.log 结束 ---');
+    } catch (e) { }
+}
+
+function killChrome(chrome) {
+    if (!chrome || !chrome.pid) return;
+    try {
+        process.kill(-chrome.pid, 'SIGKILL'); // detached 启动，杀整个进程组
+    } catch (e) {
+        try { chrome.kill('SIGKILL'); } catch (e2) { }
+    }
+}
+
+async function launchChromeOnce(attempt) {
+    // 每次重试都用干净的 profile：上次崩溃留下的锁/单例文件会让新进程直接把请求转交给已死的实例
+    try { fs.rmSync(CHROME_USER_DATA_DIR, { recursive: true, force: true }); } catch (e) { }
 
     const args = [
         `--remote-debugging-port=${DEBUG_PORT}`,
@@ -183,7 +204,7 @@ async function launchChrome() {
         '--window-size=1280,720',
         '--no-sandbox',
         '--disable-setuid-sandbox',
-        '--user-data-dir=/tmp/chrome_user_data' // 必须指定用户数据目录，否则远程调试可能失败
+        `--user-data-dir=${CHROME_USER_DATA_DIR}` // 必须指定用户数据目录，否则远程调试可能失败
     ];
 
     if (PROXY_CONFIG) {
@@ -193,23 +214,62 @@ async function launchChrome() {
     // 添加针对 Linux 环境的额外稳定性参数
     args.push('--disable-dev-shm-usage'); // 避免共享内存不足
 
+    // 把 Chrome 自己的 stdout/stderr 落盘：原来 stdio: 'ignore' 会丢掉它起不来的真正原因
+    const logFd = fs.openSync(CHROME_LOG_PATH, 'a');
+    fs.writeSync(logFd, `\n===== Chrome 启动尝试 ${attempt} @ ${new Date().toISOString()} =====\n`);
+    fs.writeSync(logFd, `命令: ${CHROME_PATH} ${args.join(' ')}\n`);
 
     const chrome = spawn(CHROME_PATH, args, {
         detached: true,
-        stdio: 'ignore'
+        stdio: ['ignore', logFd, logFd]
     });
     chrome.unref();
+    fs.closeSync(logFd); // 子进程已继承该 fd，父进程可以关掉
 
-    console.log('正在等待 Chrome 初始化...');
-    for (let i = 0; i < 20; i++) {
-        if (await checkPort(DEBUG_PORT)) break;
-        await new Promise(r => setTimeout(r, 1000));
+    let exitInfo = null;
+    chrome.on('exit', (code, signal) => { exitInfo = { code, signal }; });
+    chrome.on('error', (err) => { exitInfo = { code: null, signal: null, error: err.message }; });
+
+    const deadline = Date.now() + CHROME_START_TIMEOUT_MS;
+    while (Date.now() < deadline) {
+        if (await checkPort(DEBUG_PORT)) return true;
+        if (exitInfo) break;
+        await sleep(500);
     }
 
-    if (!await checkPort(DEBUG_PORT)) {
-        console.error('Chrome 无法在端口 ' + DEBUG_PORT + ' 上启动');
-        throw new Error('Chrome 启动失败');
+    if (await checkPort(DEBUG_PORT)) return true;
+
+    if (exitInfo) {
+        console.error(`Chrome 第 ${attempt} 次启动失败：进程已退出 (code=${exitInfo.code}, signal=${exitInfo.signal}${exitInfo.error ? `, error=${exitInfo.error}` : ''})`);
+    } else {
+        console.error(`Chrome 第 ${attempt} 次启动失败：进程仍在运行，但 ${CHROME_START_TIMEOUT_MS / 1000}s 内端口 ${DEBUG_PORT} 未监听`);
     }
+    killChrome(chrome);
+    printChromeLog();
+    return false;
+}
+
+async function launchChrome() {
+    console.log('检查 Chrome 是否已在端口 ' + DEBUG_PORT + ' 上运行...');
+    if (await checkPort(DEBUG_PORT)) {
+        console.log('Chrome 已开启。');
+        return;
+    }
+
+    for (let attempt = 1; attempt <= CHROME_START_ATTEMPTS; attempt++) {
+        console.log(`正在启动 Chrome (第 ${attempt}/${CHROME_START_ATTEMPTS} 次, 路径: ${CHROME_PATH})...`);
+        if (await launchChromeOnce(attempt)) {
+            console.log('Chrome 已就绪。');
+            return;
+        }
+        if (attempt < CHROME_START_ATTEMPTS) {
+            console.log('5 秒后重试...');
+            await sleep(5000);
+        }
+    }
+
+    printChromeLog(80);
+    throw new Error(`Chrome 启动失败（已重试 ${CHROME_START_ATTEMPTS} 次）`);
 }
 
 function getUsers() {
